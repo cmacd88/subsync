@@ -1,2 +1,1 @@
-# subsync
-Naive subtitle sync
+# simple-subtitle-sync
