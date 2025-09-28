@@ -1,117 +1,231 @@
-use regex::Regex;
-use std::fs::File;
-use std::io::prelude::*;
+mod cli;
+mod framerate_detector;
+mod subtitle_parser;
 
-/*
-Create the main function, allowing us to run the program from the command line. The program will take four arguments:
+use anyhow::{anyhow, Result};
+use cli::{Cli, Commands};
+use framerate_detector::{FramerateDetector, FramerateDetection};
+use subtitle_parser::SubtitleFile;
+use std::process;
 
-    -i = input_file.srt - Mandatory
-
-    -o = output_file.srt - Optional, defaults to Output.srt
-    -if = input framerate - Optional, defaults to 29.97
-    -of = output framerate - Optional, defaults to 29.97
-
-    -h Display this help.
-
-*/
-
-// Create a function to convert a hh:mm:ss,mmm string to miliseconds as an integer.
-fn convert_to_miliseconds(time: &str) -> i32 {
-    let re = Regex::new(r"(\d{2}):(\d{2}):(\d{2}),(\d{3})").unwrap();
-    let caps = re.captures(time).unwrap();
-    let hours = caps.get(1).unwrap().as_str().parse::<i32>().unwrap();
-    let minutes = caps.get(2).unwrap().as_str().parse::<i32>().unwrap();
-    let seconds = caps.get(3).unwrap().as_str().parse::<i32>().unwrap();
-    let miliseconds = caps.get(4).unwrap().as_str().parse::<i32>().unwrap();
-    let total_miliseconds = (hours * 3600000) + (minutes * 60000) + (seconds * 1000) + miliseconds;
-    total_miliseconds
-}
-
-// Create a function to convert miliseconds to a hh:mm:ss,mmm string.
-fn convert_to_time(miliseconds: i32) -> String {
-    let hours = miliseconds / 3600000;
-    let minutes = (miliseconds - (hours * 3600000)) / 60000;
-    let seconds = (miliseconds - (hours * 3600000) - (minutes * 60000)) / 1000;
-    let miliseconds = miliseconds - (hours * 3600000) - (minutes * 60000) - (seconds * 1000);
-    let time = format!(
-        "{:02}:{:02}:{:02},{:03}",
-        hours, minutes, seconds, miliseconds
-    );
-    time
-}
-
-// Create a function to convert a timecode to a new framerate.
-fn convert_timecode(timecode: &str, input_framerate: f32, output_framerate: f32) -> String {
-    let miliseconds = convert_to_miliseconds(timecode);
-    let new_miliseconds = (miliseconds as f32 * input_framerate / output_framerate) as i32;
-    let new_timecode = convert_to_time(new_miliseconds);
-    new_timecode
-}
-// Create a function to regex replace all timecodes with converted timecodes in an input string.
-fn convert_timecodes(input: &str, input_framerate: f32, output_framerate: f32) -> String {
-    let re = Regex::new(r"(\d{2}):(\d{2}):(\d{2}),(\d{3})").unwrap();
-    let output = re.replace_all(input, |caps: &regex::Captures| {
-        let timecode = caps.get(0).unwrap().as_str();
-        let new_timecode = convert_timecode(timecode, input_framerate, output_framerate);
-        new_timecode
-    });
-    output.to_string()
-}
-
-// Create a function that Reads the input file, converts the timecodes, and writes the output file.
-fn convert_file(input_file: &str, output_file: &str, input_framerate: f32, output_framerate: f32) {
-    let mut file = File::open(input_file).expect("Unable to open file");
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .expect("Unable to read file");
-    let output = convert_timecodes(&contents, input_framerate, output_framerate);
-    let mut output_file = File::create(output_file).expect("Unable to create file");
-    output_file
-        .write_all(output.as_bytes())
-        .expect("Unable to write file");
-}
-
-// Create the main function, which parses and validates arguments, and calls the convert_file function on the input file.
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut input_file = String::new();
-    let mut output_file = String::new();
-    let mut input_framerate = 29.97;
-    let mut output_framerate = 29.97;
-    let mut help = false;
-    for i in 0..args.len() {
-        if args[i] == "-i" {
-            input_file = args[i + 1].clone();
-        } else if args[i] == "-o" {
-            output_file = args[i + 1].clone();
-        } else if args[i] == "-if" {
-            input_framerate = args[i + 1].parse::<f32>().unwrap();
-        } else if args[i] == "-of" {
-            output_framerate = args[i + 1].parse::<f32>().unwrap();
-        } else if args[i] == "-h" {
-            help = true;
+    if let Err(e) = run() {
+        eprintln!("Error: {}", e);
+        process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse_args();
+
+    match cli.command {
+        Commands::Convert {
+            input,
+            output,
+            from_fps,
+            to_fps,
+            force,
+            verbose,
+        } => {
+            handle_convert(input, output, from_fps, to_fps, force, verbose)?;
+        }
+        Commands::Analyze { input, verbose } => {
+            handle_analyze(input, verbose)?;
+        }
+        Commands::Info => {
+            cli::show_framerate_info();
         }
     }
-    if help == true {
-        println!("
-    -i = input file path. Expect a string denoting a path to an .srt file.
-    -o = output file path. This is optional. If not provided, the program will write to a file named output.srt in the same directory as the input file.
-    -if = input framerate. Optional float, defaults to 29.97
-    -of = output framerate. Optional float, defaults to 29.97
-    -h Display help.
-    ");
-    } else if input_file == "" {
-        println!("No input file provided. Use -h for help.");
+
+    Ok(())
+}
+
+fn handle_convert(
+    input: std::path::PathBuf,
+    output: Option<std::path::PathBuf>,
+    from_fps: Option<f32>,
+    to_fps: f32,
+    force: bool,
+    verbose: bool,
+) -> Result<()> {
+    // Load subtitle file
+    if verbose {
+        println!("Loading subtitle file: {}", input.display());
+    }
+    
+    let mut subtitle_file = SubtitleFile::from_file(&input)?;
+    
+    // Validate subtitle file
+    let warnings = subtitle_file.validate()?;
+    if !warnings.is_empty() && verbose {
+        println!("Validation warnings:");
+        for warning in &warnings {
+            println!("  ⚠️  {}", warning);
+        }
+        println!();
+    }
+
+    // Determine source framerate
+    let source_fps = if let Some(fps) = from_fps {
+        if verbose {
+            println!("Using specified source framerate: {} fps", fps);
+        }
+        fps
     } else {
-        if output_file == "" {
-            let re = Regex::new(r"(.*)\.srt").unwrap();
-            let caps = re.captures(&input_file).unwrap();
-            let output_file_name = caps.get(1).unwrap().as_str();
-            output_file = format!(
-                "{}-{}-{}.srt",
-                output_file_name, input_framerate, output_framerate
+        if verbose {
+            println!("Detecting source framerate...");
+        }
+        
+        let detection = detect_framerate(&subtitle_file, verbose)?;
+        
+        if detection.confidence < 0.5 && !force {
+            return Err(anyhow!(
+                "Low confidence framerate detection ({:.1}% confidence for {} fps). \
+                Use --force to proceed anyway, or specify --from-fps manually.",
+                detection.confidence * 100.0,
+                detection.framerate
+            ));
+        }
+        
+        if verbose {
+            println!(
+                "Detected framerate: {} fps (confidence: {:.1}%, method: {})",
+                detection.framerate,
+                detection.confidence * 100.0,
+                detection.method
+            );
+        } else {
+            println!(
+                "Detected source framerate: {} fps ({:.1}% confidence)",
+                detection.framerate,
+                detection.confidence * 100.0
             );
         }
-        convert_file(&input_file, &output_file, input_framerate, output_framerate);
+        
+        detection.framerate
+    };
+
+    // Check if conversion is needed
+    if (source_fps - to_fps).abs() < 0.001 {
+        println!("Source and target framerates are the same. No conversion needed.");
+        return Ok(());
     }
+
+    // Perform conversion
+    if verbose {
+        println!("Converting from {} fps to {} fps...", source_fps, to_fps);
+    }
+    
+    subtitle_file.convert_framerate(source_fps, to_fps)?;
+
+    // Determine output path
+    let output_path = output.unwrap_or_else(|| {
+        cli::generate_output_filename(&input, source_fps, to_fps)
+    });
+
+    // Save converted file
+    subtitle_file.save_to_file(&output_path)?;
+    
+    println!("✅ Conversion complete!");
+    println!("   Input:  {} ({} fps)", input.display(), source_fps);
+    println!("   Output: {} ({} fps)", output_path.display(), to_fps);
+    
+    // Show post-conversion validation
+    let post_warnings = subtitle_file.validate()?;
+    if !post_warnings.is_empty() && verbose {
+        println!("\nPost-conversion validation:");
+        for warning in &post_warnings {
+            println!("  ⚠️  {}", warning);
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_analyze(input: std::path::PathBuf, verbose: bool) -> Result<()> {
+    println!("Analyzing subtitle file: {}", input.display());
+    
+    let subtitle_file = SubtitleFile::from_file(&input)?;
+    
+    // Basic file info
+    println!("\n📊 File Information:");
+    println!("   Subtitle entries: {}", subtitle_file.entries.len());
+    
+    if let (Some(first), Some(last)) = (subtitle_file.entries.first(), subtitle_file.entries.last()) {
+        println!("   First subtitle: {}", first.start_time);
+        println!("   Last subtitle:  {}", last.end_time);
+        
+        let start_ms = subtitle_parser::timestamp_to_milliseconds(&first.start_time)?;
+        let end_ms = subtitle_parser::timestamp_to_milliseconds(&last.end_time)?;
+        let duration_ms = end_ms - start_ms;
+        let duration_min = duration_ms as f32 / 60000.0;
+        
+        println!("   Total duration: {:.1} minutes", duration_min);
+    }
+
+    // Framerate detection
+    println!("\n🔍 Framerate Analysis:");
+    let detection = detect_framerate(&subtitle_file, verbose)?;
+    
+    println!("   Detected framerate: {} fps", detection.framerate);
+    println!("   Confidence: {:.1}%", detection.confidence * 100.0);
+    println!("   Detection method: {}", detection.method);
+    
+    if detection.confidence < 0.7 {
+        println!("   ⚠️  Low confidence detection - consider manual specification");
+    }
+
+    // Validation
+    let warnings = subtitle_file.validate()?;
+    if !warnings.is_empty() {
+        println!("\n⚠️  Validation Issues:");
+        for warning in &warnings {
+            println!("   {}", warning);
+        }
+    } else {
+        println!("\n✅ No validation issues found");
+    }
+
+    // Detailed statistics if verbose
+    if verbose {
+        let mut detector = FramerateDetector::new();
+        let content = std::fs::read_to_string(&input)?;
+        detector.analyze_srt_content(&content)?;
+        let stats = detector.get_statistics();
+        
+        println!("\n📈 Detailed Statistics:");
+        for (key, value) in stats {
+            println!("   {}: {:.2}", key, value);
+        }
+    }
+
+    Ok(())
+}
+
+fn detect_framerate(subtitle_file: &SubtitleFile, verbose: bool) -> Result<FramerateDetection> {
+    let mut detector = FramerateDetector::new();
+    
+    // Convert subtitle timing info to detector format
+    for entry in &subtitle_file.entries {
+        let start_ms = subtitle_parser::timestamp_to_milliseconds(&entry.start_time)?;
+        let end_ms = subtitle_parser::timestamp_to_milliseconds(&entry.end_time)?;
+        
+        detector.timings.push(framerate_detector::SubtitleTiming {
+            start_ms,
+            end_ms,
+            duration_ms: end_ms - start_ms,
+        });
+    }
+    
+    let detection = detector.detect_framerate()?;
+    
+    if verbose {
+        let stats = detector.get_statistics();
+        println!("Detection statistics:");
+        for (key, value) in stats {
+            println!("  {}: {:.2}", key, value);
+        }
+    }
+    
+    Ok(detection)
 }
